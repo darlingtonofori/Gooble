@@ -302,7 +302,7 @@ class GoobleService : Service() {
                     .openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     setRequestProperty("Content-Type","application/json")
-                    setRequestProperty("Authorization","Bearer sk-or-v1-free")
+                    setRequestProperty("Authorization","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")
                     setRequestProperty("HTTP-Referer","https://gooble.app")
                     connectTimeout=12000; readTimeout=20000; doOutput=true
                 }
