@@ -2,7 +2,6 @@ package com.example.gooble
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.Intent
 import android.graphics.Path
 import android.os.Build
 import android.view.accessibility.AccessibilityEvent
@@ -28,9 +27,9 @@ class GoobleAccessibilityService : AccessibilityService() {
         }
 
         private fun searchAndClick(node: AccessibilityNodeInfo, text: String): Boolean {
-            val nodeText = node.text?.toString()?.lowercase() ?: ""
-            val nodeDesc = node.contentDescription?.toString()?.lowercase() ?: ""
-            if ((nodeText.contains(text.lowercase()) || nodeDesc.contains(text.lowercase())) && node.isClickable) {
+            val t = node.text?.toString()?.lowercase() ?: ""
+            val d = node.contentDescription?.toString()?.lowercase() ?: ""
+            if ((t.contains(text.lowercase()) || d.contains(text.lowercase())) && node.isClickable) {
                 node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                 return true
             }
@@ -45,7 +44,7 @@ class GoobleAccessibilityService : AccessibilityService() {
             val root = instance?.rootInActiveWindow ?: return ""
             val sb = StringBuilder()
             extractText(root, sb)
-            return sb.toString()
+            return sb.toString().take(800)
         }
 
         private fun extractText(node: AccessibilityNodeInfo, sb: StringBuilder) {
@@ -56,17 +55,19 @@ class GoobleAccessibilityService : AccessibilityService() {
                 extractText(child, sb)
             }
         }
+
+        fun typeText(node: AccessibilityNodeInfo?, text: String) {
+            node?.let {
+                val args = android.os.Bundle()
+                args.putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                it.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            }
+        }
     }
 
-    override fun onServiceConnected() {
-        instance = this
-    }
-
+    override fun onServiceConnected() { instance = this }
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
-
-    override fun onDestroy() {
-        instance = null
-        super.onDestroy()
-    }
+    override fun onDestroy() { instance = null; super.onDestroy() }
 }
