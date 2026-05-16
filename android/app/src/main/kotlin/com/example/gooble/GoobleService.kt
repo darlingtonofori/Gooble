@@ -8,8 +8,8 @@ import android.os.*
 import android.provider.Settings
 import android.speech.*
 import android.view.*
-import android.view.accessibility.AccessibilityNodeInfo
 import androidx.core.app.NotificationCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -37,6 +37,9 @@ class GoobleService : Service() {
     private var holdTriggered = false
     private var apiKey = ""
 
+    // Conversation history for context
+    private val chatHistory = mutableListOf<JSONObject>()
+
     override fun onBind(i: Intent?) = null
 
     override fun onCreate() {
@@ -47,7 +50,6 @@ class GoobleService : Service() {
         val pt = Point(); wm.defaultDisplay.getSize(pt)
         sw = pt.x; sh = pt.y
 
-        // Load cursor
         try {
             val id = resources.getIdentifier("gooble_cursor", "drawable", packageName)
             if (id != 0) {
@@ -56,9 +58,7 @@ class GoobleService : Service() {
             }
         } catch (e: Exception) { cursorBmp = null }
 
-        // Fetch API key from VPS
         fetchApiKey()
-
         setupCursor()
         setupBubble()
         startRoaming()
@@ -70,8 +70,10 @@ class GoobleService : Service() {
         Thread {
             try {
                 val resp = URL("https://dialpedia.top/gooble/config.php")
-                    .openConnection().apply { connectTimeout = 8000 }
-                    .getInputStream().bufferedReader().readText()
+                    .openConnection().apply {
+                        connectTimeout = 8000
+                        readTimeout = 8000
+                    }.getInputStream().bufferedReader().readText()
                 apiKey = JSONObject(resp).getString("key")
             } catch (e: Exception) { apiKey = "" }
         }.start()
@@ -180,8 +182,8 @@ class GoobleService : Service() {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else WindowManager.LayoutParams.TYPE_PHONE,
             if (touchable)
-    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN 
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             else
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
@@ -255,17 +257,51 @@ class GoobleService : Service() {
     private fun processCommand(cmd: String) {
         val lower = cmd.lowercase()
         when {
-            // Open app commands
             lower.startsWith("open ") -> {
                 val appName = lower.removePrefix("open ").trim()
-                showBubble("opening $appName... 👀", 2000)
-                handler.postDelayed({ launchApp(appName) }, 500)
+                showBubble("opening $appName 👀",2000)
+                handler.postDelayed({ launchApp(appName) },500)
             }
-            // Screenshot + describe
-            lower.contains("what") && lower.contains("screen") -> {
-                takeScreenshotAndDescribe()
+            lower.contains("click") || lower.contains("tap") -> {
+                val target = lower.replace("click","").replace("tap","").trim()
+                showBubble("finding $target 👀",2000)
+                handler.postDelayed({
+                    val found = GoobleAccessibilityService.findAndClick(target)
+                    if (!found) showBubble("couldn't find $target",2500)
+                    else showBubble("done ✓",2000)
+                },500)
             }
-            // Everything else → AI
+            lower.contains("what") && (lower.contains("screen") || lower.contains("this")) -> {
+                val screenText = GoobleAccessibilityService.getScreenText()
+                if (screenText.isNotEmpty()) {
+                    askHermes("what's on my screen: $screenText")
+                } else {
+                    showBubble("enable accessibility in settings 👀",3000)
+                }
+            }
+            lower.contains("go back") || lower.contains("back") -> {
+                GoobleAccessibilityService.instance?.performGlobalAction(
+                    AccessibilityService.GLOBAL_ACTION_BACK)
+                showBubble("going back 👀",1500)
+            }
+            lower.contains("home") -> {
+                GoobleAccessibilityService.instance?.performGlobalAction(
+                    AccessibilityService.GLOBAL_ACTION_HOME)
+                showBubble("going home 👀",1500)
+            }
+            lower.contains("recent") || lower.contains("recents") -> {
+                GoobleAccessibilityService.instance?.performGlobalAction(
+                    AccessibilityService.GLOBAL_ACTION_RECENTS)
+                showBubble("recent apps 👀",1500)
+            }
+            lower.contains("scroll down") -> {
+                GoobleAccessibilityService.tap(sw/2f, sh*0.7f)
+                showBubble("scrolling 👀",1500)
+            }
+            lower.contains("scroll up") -> {
+                GoobleAccessibilityService.tap(sw/2f, sh*0.3f)
+                showBubble("scrolling up 👀",1500)
+            }
             else -> askHermes(cmd)
         }
     }
@@ -282,13 +318,13 @@ class GoobleService : Service() {
             "telegram" to "org.telegram.messenger",
             "settings" to "com.android.settings",
             "camera" to "com.android.camera2",
-            "gallery" to "com.android.gallery3d",
             "maps" to "com.google.android.apps.maps",
             "gmail" to "com.google.android.gm",
             "spotify" to "com.spotify.music",
             "tiktok" to "com.zhiliaoapp.musically",
             "snapchat" to "com.snapchat.android",
             "facebook" to "com.facebook.katana",
+            "capcut" to "com.lemon.lvoverseas",
             "phone" to "com.android.dialer",
             "messages" to "com.google.android.apps.messaging",
             "contacts" to "com.android.contacts",
@@ -297,7 +333,9 @@ class GoobleService : Service() {
             "calendar" to "com.google.android.calendar",
             "files" to "com.google.android.documentsui",
             "play store" to "com.android.vending",
-            "netflix" to "com.netflix.mediaclient"
+            "netflix" to "com.netflix.mediaclient",
+            "photos" to "com.google.android.apps.photos",
+            "gallery" to "com.sec.android.gallery3d"
         )
         val pkg = packages.entries.firstOrNull { name.contains(it.key) }?.value
         if (pkg != null) {
@@ -306,11 +344,10 @@ class GoobleService : Service() {
                 if (launch != null) {
                     launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     startActivity(launch)
-                    showBubble("opened $name 👀", 2000)
-                } else showBubble("$name not installed", 2500)
-            } catch(e:Exception) { showBubble("couldn't open $name", 2500) }
+                    showBubble("opened $name ✓",2000)
+                } else showBubble("$name not installed",2500)
+            } catch(e:Exception) { showBubble("couldn't open $name",2500) }
         } else {
-            // Try searching by app name
             try {
                 val apps = pm.getInstalledApplications(0)
                 val match = apps.firstOrNull {
@@ -321,24 +358,11 @@ class GoobleService : Service() {
                     if (launch != null) {
                         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         startActivity(launch)
-                        showBubble("opened ${pm.getApplicationLabel(match)} 👀", 2000)
+                        showBubble("opened ${pm.getApplicationLabel(match)} ✓",2000)
                     }
-                } else askHermes("user said: open $name. respond in 20 words max.")
-            } catch(e:Exception) { showBubble("couldn't find $name", 2500) }
+                } else showBubble("can't find $name",2500)
+            } catch(e:Exception) { showBubble("error opening $name",2500) }
         }
-    }
-
-    private fun takeScreenshotAndDescribe() {
-        // Requires MediaProjection — guide user
-        if (!Settings.canDrawOverlays(this)) {
-            showBubble("need accessibility for screen reading", 3000)
-            return
-        }
-        // For now take visible window content description via accessibility
-        showBubble("reading screen... 👀", 2000)
-        handler.postDelayed({
-            askHermes("describe what might be on an Android phone screen right now in 25 words")
-        }, 500)
     }
 
     private fun startRoaming() {
@@ -387,8 +411,9 @@ class GoobleService : Service() {
     private fun askHermes(prompt: String) {
         if (thinking) return
         if (apiKey.isEmpty()) {
-            showBubble("fetching AI config...", 2000)
-            handler.postDelayed({ askHermes(prompt) }, 2000)
+            fetchApiKey()
+            showBubble("connecting...",2000)
+            handler.postDelayed({ askHermes(prompt) },2500)
             return
         }
         thinking=true; glowing=true
@@ -397,6 +422,13 @@ class GoobleService : Service() {
             bText=""; bubbleView.visibility=View.VISIBLE
             bVisible=true; bubbleView.invalidate(); cursorView.invalidate()
         }
+
+        // Add to history
+        chatHistory.add(JSONObject().apply {
+            put("role","user"); put("content",prompt)
+        })
+        if (chatHistory.size > 10) chatHistory.removeAt(0)
+
         Thread {
             try {
                 val conn=(URL("https://openrouter.ai/api/v1/chat/completions")
@@ -404,14 +436,32 @@ class GoobleService : Service() {
                     requestMethod="POST"
                     setRequestProperty("Content-Type","application/json")
                     setRequestProperty("Authorization","Bearer $apiKey")
-                    setRequestProperty("HTTP-Referer","https://gooble.app")
+                    setRequestProperty("HTTP-Referer","https://dialpedia.top")
                     connectTimeout=12000; readTimeout=20000; doOutput=true
                 }
-                val safe=prompt.replace("\"","'").replace("\n"," ")
-                conn.outputStream.write("""{"model":"nousresearch/hermes-3-llama-3.1-405b:free","messages":[{"role":"system","content":"You are Gooble, a witty AI cursor assistant living on the user phone screen. Max 25 words. Be sharp and helpful."},{"role":"user","content":"$safe"}]}""".toByteArray())
+
+                val messages = JSONArray()
+                messages.put(JSONObject().apply {
+                    put("role","system")
+                    put("content","You are Gooble, a witty AI cursor that lives on the user's Android screen. You can open apps, tap UI elements, read screen content, and answer questions. Keep replies under 25 words unless explaining something complex. Be sharp, helpful and fun.")
+                })
+                chatHistory.forEach { messages.put(it) }
+
+                conn.outputStream.write(
+                    JSONObject().apply {
+                        put("model","nousresearch/hermes-3-llama-3.1-405b:free")
+                        put("messages",messages)
+                    }.toString().toByteArray()
+                )
+
                 val reply=JSONObject(conn.inputStream.bufferedReader().readText())
                     .getJSONArray("choices").getJSONObject(0)
                     .getJSONObject("message").getString("content").trim()
+
+                chatHistory.add(JSONObject().apply {
+                    put("role","assistant"); put("content",reply)
+                })
+
                 handler.post { thinking=false; glowing=false; showBubble(reply,7000) }
             } catch(e:Exception) {
                 handler.post { thinking=false; glowing=false; showBubble("network issue 👀",3000) }
