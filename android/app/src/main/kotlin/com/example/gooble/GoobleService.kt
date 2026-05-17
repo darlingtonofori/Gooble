@@ -9,6 +9,7 @@ import android.speech.*
 import android.view.*
 import android.accessibilityservice.AccessibilityService
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -33,6 +34,7 @@ class GoobleService : Service() {
     private var glowCol = Color.argb(200, 80, 160, 255)
     private var cursorBmp: Bitmap? = null
     private var holdTriggered = false
+    private var apiKey = ""
 
     override fun onBind(i: Intent?) = null
 
@@ -52,11 +54,23 @@ class GoobleService : Service() {
             }
         } catch (e: Exception) { cursorBmp = null }
 
+        fetchKey()
         setupCursor()
         setupBubble()
         startRoaming()
 
         handler.postDelayed({ showBubble("👀 tap & hold me to talk", 4000) }, 1200)
+    }
+
+    private fun fetchKey() {
+        Thread {
+            try {
+                val resp = URL("https://dialpedia.top/gooble/config.php")
+                    .openConnection().apply { connectTimeout=8000; readTimeout=8000 }
+                    .getInputStream().bufferedReader().readText()
+                apiKey = JSONObject(resp).getString("key")
+            } catch (e: Exception) {}
+        }.start()
     }
 
     private fun setupCursor() {
@@ -256,7 +270,7 @@ class GoobleService : Service() {
                 if (screenText.isNotEmpty()) askAI("what's on screen: $screenText summarize in 25 words")
                 else showBubble("enable accessibility first 👀",3000)
             }
-            lower.contains("go back") || lower == "back" -> {
+            lower.contains("go back") || lower=="back" -> {
                 GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
                 showBubble("going back 👀",1500)
             }
@@ -373,6 +387,12 @@ class GoobleService : Service() {
 
     private fun askAI(prompt: String) {
         if (thinking) return
+        if (apiKey.isEmpty()) {
+            fetchKey()
+            showBubble("connecting...",2000)
+            handler.postDelayed({ askAI(prompt) },2500)
+            return
+        }
         thinking=true; glowing=true
         glowCol=Color.argb(200,160,80,255)
         handler.post {
@@ -381,15 +401,18 @@ class GoobleService : Service() {
         }
         Thread {
             try {
-                val encoded = java.net.URLEncoder.encode(prompt, "UTF-8")
-                val system = java.net.URLEncoder.encode(
-                    "You are Gooble, a witty AI cursor assistant living on an Android phone screen. You can open apps, guide users, answer questions. Max 25 words. Be sharp and helpful.", "UTF-8")
-                val url = URL("https://text.pollinations.ai/${encoded}?system=${system}&model=openai")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 12000
-                conn.readTimeout = 20000
-                val reply = conn.inputStream.bufferedReader().readText().trim()
+                val conn=(URL("https://api.groq.com/openai/v1/chat/completions")
+                    .openConnection() as HttpURLConnection).apply {
+                    requestMethod="POST"
+                    setRequestProperty("Content-Type","application/json")
+                    setRequestProperty("Authorization","Bearer $apiKey")
+                    connectTimeout=12000; readTimeout=20000; doOutput=true
+                }
+                val safe=prompt.replace("\"","'").replace("\n"," ")
+                conn.outputStream.write("""{"model":"llama-3.1-8b-instant","messages":[{"role":"system","content":"You are Gooble, a witty AI cursor assistant on Android. Max 25 words. Be sharp and helpful."},{"role":"user","content":"$safe"}]}""".toByteArray())
+                val reply=JSONObject(conn.inputStream.bufferedReader().readText())
+                    .getJSONArray("choices").getJSONObject(0)
+                    .getJSONObject("message").getString("content").trim()
                 handler.post { thinking=false; glowing=false; showBubble(reply,7000) }
             } catch(e:Exception) {
                 handler.post { thinking=false; glowing=false; showBubble("try again 👀",3000) }
