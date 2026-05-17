@@ -5,15 +5,12 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.*
 import android.os.*
-import android.provider.Settings
 import android.speech.*
 import android.view.*
+import android.accessibilityservice.AccessibilityService
 import androidx.core.app.NotificationCompat
-import org.json.JSONArray
-import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import android.accessibilityservice.AccessibilityService
 
 class GoobleService : Service() {
 
@@ -36,10 +33,6 @@ class GoobleService : Service() {
     private var glowCol = Color.argb(200, 80, 160, 255)
     private var cursorBmp: Bitmap? = null
     private var holdTriggered = false
-    private var apiKey = ""
-
-    // Conversation history for context
-    private val chatHistory = mutableListOf<JSONObject>()
 
     override fun onBind(i: Intent?) = null
 
@@ -59,25 +52,11 @@ class GoobleService : Service() {
             }
         } catch (e: Exception) { cursorBmp = null }
 
-        fetchApiKey()
         setupCursor()
         setupBubble()
         startRoaming()
 
         handler.postDelayed({ showBubble("👀 tap & hold me to talk", 4000) }, 1200)
-    }
-
-    private fun fetchApiKey() {
-        Thread {
-            try {
-                val resp = URL("https://dialpedia.top/gooble/config.php")
-                    .openConnection().apply {
-                        connectTimeout = 8000
-                        readTimeout = 8000
-                    }.getInputStream().bufferedReader().readText()
-                apiKey = JSONObject(resp).getString("key")
-            } catch (e: Exception) { apiKey = "" }
-        }.start()
     }
 
     private fun setupCursor() {
@@ -272,38 +251,24 @@ class GoobleService : Service() {
                     else showBubble("done ✓",2000)
                 },500)
             }
-            lower.contains("what") && (lower.contains("screen") || lower.contains("this")) -> {
+            lower.contains("what") && (lower.contains("screen")||lower.contains("this")) -> {
                 val screenText = GoobleAccessibilityService.getScreenText()
-                if (screenText.isNotEmpty()) {
-                    askHermes("what's on my screen: $screenText")
-                } else {
-                    showBubble("enable accessibility in settings 👀",3000)
-                }
+                if (screenText.isNotEmpty()) askAI("what's on screen: $screenText summarize in 25 words")
+                else showBubble("enable accessibility first 👀",3000)
             }
-            lower.contains("go back") || lower.contains("back") -> {
-                GoobleAccessibilityService.instance?.performGlobalAction(
-                    AccessibilityService.GLOBAL_ACTION_BACK)
+            lower.contains("go back") || lower == "back" -> {
+                GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
                 showBubble("going back 👀",1500)
             }
             lower.contains("home") -> {
-                GoobleAccessibilityService.instance?.performGlobalAction(
-                    AccessibilityService.GLOBAL_ACTION_HOME)
+                GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
                 showBubble("going home 👀",1500)
             }
-            lower.contains("recent") || lower.contains("recents") -> {
-                GoobleAccessibilityService.instance?.performGlobalAction(
-                    AccessibilityService.GLOBAL_ACTION_RECENTS)
+            lower.contains("recent") -> {
+                GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
                 showBubble("recent apps 👀",1500)
             }
-            lower.contains("scroll down") -> {
-                GoobleAccessibilityService.tap(sw/2f, sh*0.7f)
-                showBubble("scrolling 👀",1500)
-            }
-            lower.contains("scroll up") -> {
-                GoobleAccessibilityService.tap(sw/2f, sh*0.3f)
-                showBubble("scrolling up 👀",1500)
-            }
-            else -> askHermes(cmd)
+            else -> askAI(cmd)
         }
     }
 
@@ -318,25 +283,25 @@ class GoobleService : Service() {
             "x" to "com.twitter.android",
             "telegram" to "org.telegram.messenger",
             "settings" to "com.android.settings",
-            "camera" to "com.android.camera2",
-            "maps" to "com.google.android.apps.maps",
-            "gmail" to "com.google.android.gm",
-            "spotify" to "com.spotify.music",
+            "capcut" to "com.lemon.lvoverseas",
             "tiktok" to "com.zhiliaoapp.musically",
             "snapchat" to "com.snapchat.android",
             "facebook" to "com.facebook.katana",
-            "capcut" to "com.lemon.lvoverseas",
-            "phone" to "com.android.dialer",
-            "messages" to "com.google.android.apps.messaging",
-            "contacts" to "com.android.contacts",
-            "calculator" to "com.android.calculator2",
-            "clock" to "com.android.deskclock",
+            "spotify" to "com.spotify.music",
+            "netflix" to "com.netflix.mediaclient",
+            "maps" to "com.google.android.apps.maps",
+            "gmail" to "com.google.android.gm",
             "calendar" to "com.google.android.calendar",
+            "camera" to "com.android.camera2",
+            "gallery" to "com.sec.android.gallery3d",
+            "photos" to "com.google.android.apps.photos",
             "files" to "com.google.android.documentsui",
             "play store" to "com.android.vending",
-            "netflix" to "com.netflix.mediaclient",
-            "photos" to "com.google.android.apps.photos",
-            "gallery" to "com.sec.android.gallery3d"
+            "phone" to "com.android.dialer",
+            "contacts" to "com.android.contacts",
+            "messages" to "com.google.android.apps.messaging",
+            "calculator" to "com.android.calculator2",
+            "clock" to "com.android.deskclock"
         )
         val pkg = packages.entries.firstOrNull { name.contains(it.key) }?.value
         if (pkg != null) {
@@ -350,18 +315,15 @@ class GoobleService : Service() {
             } catch(e:Exception) { showBubble("couldn't open $name",2500) }
         } else {
             try {
-                val apps = pm.getInstalledApplications(0)
-                val match = apps.firstOrNull {
+                val match = pm.getInstalledApplications(0).firstOrNull {
                     pm.getApplicationLabel(it).toString().lowercase().contains(name)
                 }
                 if (match != null) {
                     val launch = pm.getLaunchIntentForPackage(match.packageName)
-                    if (launch != null) {
-                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(launch)
-                        showBubble("opened ${pm.getApplicationLabel(match)} ✓",2000)
-                    }
-                } else showBubble("can't find $name",2500)
+                    launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    launch?.let { startActivity(it) }
+                    showBubble("opened ${pm.getApplicationLabel(match)} ✓",2000)
+                } else showBubble("can't find $name 👀",2500)
             } catch(e:Exception) { showBubble("error opening $name",2500) }
         }
     }
@@ -409,63 +371,28 @@ class GoobleService : Service() {
         }, duration)
     }
 
-    private fun askHermes(prompt: String) {
+    private fun askAI(prompt: String) {
         if (thinking) return
-        if (apiKey.isEmpty()) {
-            fetchApiKey()
-            showBubble("connecting...",2000)
-            handler.postDelayed({ askHermes(prompt) },2500)
-            return
-        }
         thinking=true; glowing=true
         glowCol=Color.argb(200,160,80,255)
         handler.post {
             bText=""; bubbleView.visibility=View.VISIBLE
             bVisible=true; bubbleView.invalidate(); cursorView.invalidate()
         }
-
-        // Add to history
-        chatHistory.add(JSONObject().apply {
-            put("role","user"); put("content",prompt)
-        })
-        if (chatHistory.size > 10) chatHistory.removeAt(0)
-
         Thread {
             try {
-                val conn=(URL("https://openrouter.ai/api/v1/chat/completions")
-                    .openConnection() as HttpURLConnection).apply {
-                    requestMethod="POST"
-                    setRequestProperty("Content-Type","application/json")
-                    setRequestProperty("Authorization","Bearer $apiKey")
-                    setRequestProperty("HTTP-Referer","https://dialpedia.top")
-                    connectTimeout=12000; readTimeout=20000; doOutput=true
-                }
-
-                val messages = JSONArray()
-                messages.put(JSONObject().apply {
-                    put("role","system")
-                    put("content","You are Gooble, a witty AI cursor that lives on the user's Android screen. You can open apps, tap UI elements, read screen content, and answer questions. Keep replies under 25 words unless explaining something complex. Be sharp, helpful and fun.")
-                })
-                chatHistory.forEach { messages.put(it) }
-
-                conn.outputStream.write(
-                    JSONObject().apply {
-                        put("model","nousresearch/hermes-3-llama-3.1-405b:free")
-                        put("messages",messages)
-                    }.toString().toByteArray()
-                )
-
-                val reply=JSONObject(conn.inputStream.bufferedReader().readText())
-                    .getJSONArray("choices").getJSONObject(0)
-                    .getJSONObject("message").getString("content").trim()
-
-                chatHistory.add(JSONObject().apply {
-                    put("role","assistant"); put("content",reply)
-                })
-
+                val encoded = java.net.URLEncoder.encode(prompt, "UTF-8")
+                val system = java.net.URLEncoder.encode(
+                    "You are Gooble, a witty AI cursor assistant living on an Android phone screen. You can open apps, guide users, answer questions. Max 25 words. Be sharp and helpful.", "UTF-8")
+                val url = URL("https://text.pollinations.ai/${encoded}?system=${system}&model=openai")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 12000
+                conn.readTimeout = 20000
+                val reply = conn.inputStream.bufferedReader().readText().trim()
                 handler.post { thinking=false; glowing=false; showBubble(reply,7000) }
             } catch(e:Exception) {
-                handler.post { thinking=false; glowing=false; showBubble("network issue 👀",3000) }
+                handler.post { thinking=false; glowing=false; showBubble("try again 👀",3000) }
             }
         }.start()
     }
