@@ -4,6 +4,11 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.graphics.*
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.speech.*
 import android.view.*
@@ -11,8 +16,10 @@ import android.accessibilityservice.AccessibilityService
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import android.util.Base64
 
 class GoobleService : Service() {
 
@@ -37,11 +44,16 @@ class GoobleService : Service() {
     private var holdTriggered = false
     private var apiKey = ""
 
-    // Agent state
+    // Agent
     private var agentActive = false
     private var agentSteps = mutableListOf<AgentStep>()
     private var currentStep = 0
     private var waitingForTap = false
+
+    // Screenshot
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
 
     data class AgentStep(
         val instruction: String,
@@ -69,11 +81,50 @@ class GoobleService : Service() {
         } catch (e: Exception) { cursorBmp = null }
 
         fetchKey()
+        setupProjection()
         setupCursor()
         setupBubble()
         startRoaming()
 
         handler.postDelayed({ showBubble("👀 tap & hold me to talk", 4000) }, 1200)
+    }
+
+    private fun setupProjection() {
+        try {
+            val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val data = MainActivity.projectionData ?: return
+            val code = MainActivity.projectionResultCode
+            mediaProjection = mgr.getMediaProjection(code, data)
+            imageReader = ImageReader.newInstance(sw, sh, android.graphics.PixelFormat.RGBA_8888, 2)
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "GoobleScreen", sw, sh,
+                resources.displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader?.surface, null, null
+            )
+        } catch (e: Exception) {}
+    }
+
+    private fun takeScreenshot(): Bitmap? {
+        return try {
+            val image = imageReader?.acquireLatestImage() ?: return null
+            val planes = image.planes
+            val buffer = planes[0].buffer
+            val pixelStride = planes[0].pixelStride
+            val rowStride = planes[0].rowStride
+            val rowPadding = rowStride - pixelStride * sw
+            val bmp = Bitmap.createBitmap(sw + rowPadding / pixelStride, sh, Bitmap.Config.ARGB_8888)
+            bmp.copyPixelsFromBuffer(buffer)
+            image.close()
+            // Scale down for API
+            Bitmap.createScaledBitmap(bmp, 800, (800f * sh / sw).toInt(), true)
+        } catch (e: Exception) { null }
+    }
+
+    private fun bitmapToBase64(bmp: Bitmap): String {
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 75, out)
+        return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
     }
 
     private fun fetchKey() {
@@ -91,14 +142,13 @@ class GoobleService : Service() {
         cursorView = object : View(this) {
             val gP = Paint().apply { isAntiAlias = true }
             val bP = Paint().apply { isAntiAlias = true }
-            val ringPaint = Paint().apply {
+            val ringP = Paint().apply {
                 isAntiAlias = true
                 style = Paint.Style.STROKE
                 strokeWidth = 3f
             }
 
             override fun onDraw(canvas: Canvas) {
-                // Glow
                 if (glowing && glowR > 0f) {
                     gP.color = glowCol
                     gP.maskFilter = BlurMaskFilter(glowR, BlurMaskFilter.Blur.NORMAL)
@@ -106,15 +156,10 @@ class GoobleService : Service() {
                     canvas.drawCircle(28f, 28f, 14f + glowR * 0.3f, gP)
                     gP.maskFilter = null
                 }
-
-                // Waiting for tap ring
                 if (waitingForTap) {
-                    ringPaint.color = Color.argb(200, 255, 220, 50)
-                    val ringR = 28f + (glowR * 0.5f)
-                    canvas.drawCircle(28f, 28f, ringR, ringPaint)
+                    ringP.color = Color.argb(200, 255, 220, 50)
+                    canvas.drawCircle(28f, 28f, 28f + glowR * 0.5f, ringP)
                 }
-
-                // Cursor
                 if (cursorBmp != null) {
                     canvas.drawBitmap(cursorBmp!!, 0f, 0f, bP)
                 } else {
@@ -127,7 +172,6 @@ class GoobleService : Service() {
                     }
                     canvas.drawPath(p,f); canvas.drawPath(p,s)
                 }
-
                 if (glowing) {
                     if (glowGrow) { glowR+=2.5f; if(glowR>22f) glowGrow=false }
                     else { glowR-=2.5f; if(glowR<4f) glowGrow=true }
@@ -138,9 +182,8 @@ class GoobleService : Service() {
             override fun onTouchEvent(e: MotionEvent): Boolean {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        // If agent waiting for tap — advance to next step
                         if (waitingForTap) {
-                            vib(longArrayOf(0, 30))
+                            vib(longArrayOf(0,30))
                             waitingForTap = false
                             handler.postDelayed({ nextAgentStep() }, 500)
                             return true
@@ -169,24 +212,21 @@ class GoobleService : Service() {
 
     private fun setupBubble() {
         bubbleView = object : View(this) {
-            val bg = Paint().apply { color=Color.argb(195,10,10,28); style=Paint.Style.FILL; isAntiAlias=true }
-            val sh = Paint().apply { color=Color.argb(20,255,255,255); style=Paint.Style.FILL; isAntiAlias=true }
+            val bg = Paint().apply { color=Color.argb(210,8,8,24); style=Paint.Style.FILL; isAntiAlias=true }
+            val sh = Paint().apply { color=Color.argb(25,255,255,255); style=Paint.Style.FILL; isAntiAlias=true }
             val br = Paint().apply { color=Color.argb(90,255,255,255); style=Paint.Style.STROKE; strokeWidth=1.5f; isAntiAlias=true }
-            val tp = Paint().apply { color=Color.WHITE; textSize=27f; isAntiAlias=true }
-            val sp = Paint().apply { color=Color.argb(180,255,220,50); textSize=22f; isAntiAlias=true }
+            val tp = Paint().apply { color=Color.WHITE; textSize=26f; isAntiAlias=true }
+            val sp = Paint().apply { color=Color.argb(200,255,220,50); textSize=21f; isAntiAlias=true }
             val dp = Paint().apply { style=Paint.Style.FILL; isAntiAlias=true }
 
             override fun onDraw(canvas: Canvas) {
                 if (!bVisible) return
                 val w=width.toFloat(); val h=height.toFloat()
                 val r=RectF(6f,6f,w-6f,h-6f)
-
-                // Agent mode — yellow tinted border
-                if (agentActive) br.color = Color.argb(180,255,220,50)
-                else br.color = Color.argb(90,255,255,255)
-
+                if (agentActive) br.color=Color.argb(180,255,220,50)
+                else br.color=Color.argb(90,255,255,255)
                 canvas.drawRoundRect(r,20f,20f,bg)
-                canvas.drawRoundRect(RectF(6f,6f,w-6f,h*0.42f),20f,20f,sh)
+                canvas.drawRoundRect(RectF(6f,6f,w-6f,h*0.35f),20f,20f,sh)
                 canvas.drawRoundRect(r,20f,20f,br)
 
                 if (thinking) {
@@ -198,31 +238,27 @@ class GoobleService : Service() {
                     }
                     postInvalidateDelayed(80)
                 } else {
-                    // Step counter for agent mode
-                    if (agentActive && agentSteps.isNotEmpty()) {
-                        canvas.drawText(
-                            "step ${currentStep+1}/${agentSteps.size}",
-                            16f, 28f, sp
-                        )
-                    }
-                    var y = if(agentActive && agentSteps.isNotEmpty()) 58f else 40f
+                    if (agentActive && agentSteps.isNotEmpty())
+                        canvas.drawText("step ${currentStep+1}/${agentSteps.size}",16f,28f,sp)
+                    var y=if(agentActive&&agentSteps.isNotEmpty()) 55f else 40f
                     var line=""
                     for (word in bText.split(" ")) {
                         val test=if(line.isEmpty()) word else "$line $word"
                         if (tp.measureText(test)>w-28f) {
-                            canvas.drawText(line,16f,y,tp); line=word; y+=34f
+                            canvas.drawText(line,16f,y,tp); line=word; y+=33f
                         } else line=test
                     }
                     if (line.isNotEmpty()) canvas.drawText(line,16f,y,tp)
-
-                    if (waitingForTap) {
-                        canvas.drawText("👆 tap me to continue",16f,y+36f,sp)
-                    }
+                    if (waitingForTap) canvas.drawText("👆 tap me to continue",16f,y+36f,sp)
                 }
             }
         }
         bubbleView.visibility = View.GONE
-        wm.addView(bubbleView, overlayParams(380,180,false).apply { x=px.toInt()-8; y=py.toInt()+62 })
+        // Click-through bubble
+        wm.addView(bubbleView, overlayParams(420,200,false).apply {
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            x=px.toInt()-8; y=py.toInt()+62
+        })
     }
 
     private fun overlayParams(w: Int, h: Int, touchable: Boolean) =
@@ -236,7 +272,8 @@ class GoobleService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             else
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
 
@@ -307,17 +344,12 @@ class GoobleService : Service() {
     private fun processCommand(cmd: String) {
         val lower = cmd.lowercase()
         when {
-            // Stop agent
-            lower.contains("stop") || lower.contains("cancel") -> {
-                stopAgent()
-                showBubble("stopped 👀",2000)
-            }
-            // Basic nav
-            lower.contains("go back") || lower=="back" -> {
+            lower.contains("stop")||lower.contains("cancel") -> { stopAgent(); showBubble("stopped 👀",2000) }
+            lower.contains("go back")||lower=="back" -> {
                 GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
                 showBubble("going back 👀",1500)
             }
-            lower=="home" || lower.contains("go home") -> {
+            lower=="home"||lower.contains("go home") -> {
                 GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
                 showBubble("going home 👀",1500)
             }
@@ -325,27 +357,75 @@ class GoobleService : Service() {
                 GoobleAccessibilityService.instance?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
                 showBubble("recent apps 👀",1500)
             }
-            // Open app then guide
-            lower.startsWith("open ") && !lower.contains("and") -> {
+            lower.contains("what")&&(lower.contains("screen")||lower.contains("this")||lower.contains("image")) -> {
+                analyzeScreen()
+            }
+            lower.startsWith("open ")&&!lower.contains("and")&&!lower.contains("help") -> {
                 val appName = lower.removePrefix("open ").trim()
                 showBubble("opening $appName 👀",2000)
                 handler.postDelayed({ launchApp(appName) },500)
             }
-            // Read screen
-            lower.contains("what") && (lower.contains("screen")||lower.contains("this")) -> {
-                val screenText = GoobleAccessibilityService.getScreenText()
-                if (screenText.isNotEmpty()) askAI("what's on screen: ${screenText.take(300)} summarize in 25 words")
-                else showBubble("enable accessibility first 👀",3000)
-            }
-            // AGENT MODE — anything that sounds like a task
-            lower.contains("help me") || lower.contains("create") ||
-            lower.contains("make") || lower.contains("edit") ||
-            lower.contains("open") || lower.contains("how do") ||
-            lower.contains("show me") || lower.contains("guide") -> {
-                startAgentMode(cmd)
-            }
-            else -> askAI(cmd)
+            else -> startAgentMode(cmd)
         }
+    }
+
+    // ─── VISION ─────────────────────────────────────────────────
+
+    private fun analyzeScreen() {
+        showBubble("looking at screen... 👀",3000)
+        glowing=true; glowCol=Color.argb(200,80,200,255)
+        handler.post { cursorView.invalidate() }
+
+        Thread {
+            try {
+                val bmp = takeScreenshot()
+                if (bmp == null) {
+                    // Fallback to text
+                    val text = GoobleAccessibilityService.getScreenText()
+                    if (text.isNotEmpty()) {
+                        askAI("describe what's on screen based on this UI text: ${text.take(300)}")
+                    } else {
+                        handler.post { glowing=false; showBubble("can't see screen, enable accessibility 👀",3000) }
+                    }
+                    return@Thread
+                }
+                val b64 = bitmapToBase64(bmp)
+                val conn=(URL("https://api.groq.com/openai/v1/chat/completions")
+                    .openConnection() as HttpURLConnection).apply {
+                    requestMethod="POST"
+                    setRequestProperty("Content-Type","application/json")
+                    setRequestProperty("Authorization","Bearer $apiKey")
+                    connectTimeout=15000; readTimeout=25000; doOutput=true
+                }
+                val body = JSONObject().apply {
+                    put("model","meta-llama/llama-4-scout-17b-16e-instruct")
+                    put("messages", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role","user")
+                            put("content", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("type","text")
+                                    put("text","You are Gooble, an AI screen assistant. Describe what's on this Android screen in max 40 words. Be specific about what you see.")
+                                })
+                                put(JSONObject().apply {
+                                    put("type","image_url")
+                                    put("image_url", JSONObject().apply {
+                                        put("url","data:image/jpeg;base64,$b64")
+                                    })
+                                })
+                            })
+                        })
+                    })
+                }
+                conn.outputStream.write(body.toString().toByteArray())
+                val reply=JSONObject(conn.inputStream.bufferedReader().readText())
+                    .getJSONArray("choices").getJSONObject(0)
+                    .getJSONObject("message").getString("content").trim()
+                handler.post { glowing=false; showBubble(reply,8000) }
+            } catch(e:Exception) {
+                handler.post { glowing=false; showBubble("screen read failed 👀",3000) }
+            }
+        }.start()
     }
 
     // ─── AGENT MODE ─────────────────────────────────────────────
@@ -356,153 +436,142 @@ class GoobleService : Service() {
         glowing=true; glowCol=Color.argb(200,160,80,255)
         handler.post { cursorView.invalidate() }
 
-        // Get screen context
-        val screenText = GoobleAccessibilityService.getScreenText().take(400)
-
         Thread {
             try {
+                // Take screenshot for vision context
+                val bmp = takeScreenshot()
                 val conn=(URL("https://api.groq.com/openai/v1/chat/completions")
                     .openConnection() as HttpURLConnection).apply {
                     requestMethod="POST"
                     setRequestProperty("Content-Type","application/json")
                     setRequestProperty("Authorization","Bearer $apiKey")
-                    connectTimeout=12000; readTimeout=20000; doOutput=true
+                    connectTimeout=15000; readTimeout=25000; doOutput=true
                 }
 
                 val safe = task.replace("\"","'")
-                val screen = screenText.replace("\"","'")
+                val systemPrompt = """You are Gooble, an AI cursor agent on Android ${sw}x${sh} screen.
+Return ONLY a JSON array of steps to complete the task.
+Each step: {"step":1,"instruction":"max 8 words","x":0.5,"y":0.5,"action":"tap","appToOpen":""}
+x,y = 0.0-1.0 screen fractions. action = tap/open/swipe. appToOpen only when opening app.
+Max 8 steps. Return ONLY the JSON array."""
 
-                val systemPrompt = """You are Gooble, an AI cursor agent on Android. 
-The user wants you to guide them step by step.
-Current screen content: $screen
-Screen size: ${sw}x${sh}
+                val messages = JSONArray()
+                messages.put(JSONObject().apply {
+                    put("role","system"); put("content",systemPrompt)
+                })
 
-Return ONLY a JSON array of steps. Each step:
-{"step":1,"instruction":"short what to do","x":0.5,"y":0.5,"action":"tap","appToOpen":""}
-
-Rules:
-- x,y are 0.0-1.0 fractions of screen width/height
-- action is "tap","swipe","open","type"  
-- appToOpen only if opening an app
-- instruction max 8 words
-- max 8 steps
-- Return ONLY the JSON array, nothing else"""
+                // Use vision if screenshot available
+                if (bmp != null) {
+                    val b64 = bitmapToBase64(bmp)
+                    messages.put(JSONObject().apply {
+                        put("role","user")
+                        put("content", JSONArray().apply {
+                            put(JSONObject().apply { put("type","text"); put("text","Task: $safe") })
+                            put(JSONObject().apply {
+                                put("type","image_url")
+                                put("image_url", JSONObject().apply { put("url","data:image/jpeg;base64,$b64") })
+                            })
+                        })
+                    })
+                } else {
+                    val screenText = GoobleAccessibilityService.getScreenText().take(400)
+                    messages.put(JSONObject().apply {
+                        put("role","user")
+                        put("content","Task: $safe. Screen text: $screenText")
+                    })
+                }
 
                 conn.outputStream.write(JSONObject().apply {
-                    put("model","llama-3.1-8b-instant")
-                    put("messages", JSONArray().apply {
-                        put(JSONObject().apply { put("role","system"); put("content",systemPrompt) })
-                        put(JSONObject().apply { put("role","user"); put("content","Task: $safe") })
-                    })
-                    put("temperature",0.3)
+                    put("model", if(bmp!=null) "meta-llama/llama-4-scout-17b-16e-instruct" else "llama-3.1-8b-instant")
+                    put("messages",messages)
+                    put("temperature",0.2)
                 }.toString().toByteArray())
 
-                val rawReply = JSONObject(conn.inputStream.bufferedReader().readText())
+                val rawReply=JSONObject(conn.inputStream.bufferedReader().readText())
                     .getJSONArray("choices").getJSONObject(0)
                     .getJSONObject("message").getString("content").trim()
 
-                // Parse steps
-                val jsonStart = rawReply.indexOf('[')
-                val jsonEnd = rawReply.lastIndexOf(']') + 1
-                if (jsonStart >= 0 && jsonEnd > jsonStart) {
-                    val stepsJson = JSONArray(rawReply.substring(jsonStart, jsonEnd))
+                val jsonStart=rawReply.indexOf('[')
+                val jsonEnd=rawReply.lastIndexOf(']')+1
+                if (jsonStart>=0&&jsonEnd>jsonStart) {
+                    val stepsJson=JSONArray(rawReply.substring(jsonStart,jsonEnd))
                     agentSteps.clear()
                     for (i in 0 until stepsJson.length()) {
-                        val s = stepsJson.getJSONObject(i)
-                        val appToOpen = if (s.has("appToOpen")) s.getString("appToOpen") else ""
-                        if (appToOpen.isNotEmpty()) {
-                            agentSteps.add(AgentStep(
-                                s.getString("instruction"),
-                                sw * 0.5f, sh * 0.5f,
-                                "open:$appToOpen"
-                            ))
-                        } else {
-                            agentSteps.add(AgentStep(
-                                s.getString("instruction"),
-                                sw * s.getDouble("x").toFloat(),
-                                sh * s.getDouble("y").toFloat(),
-                                if (s.has("action")) s.getString("action") else "tap"
-                            ))
-                        }
+                        val s=stepsJson.getJSONObject(i)
+                        val appToOpen=if(s.has("appToOpen")) s.getString("appToOpen") else ""
+                        agentSteps.add(AgentStep(
+                            s.getString("instruction"),
+                            if(appToOpen.isEmpty()) sw*s.getDouble("x").toFloat() else sw*0.5f,
+                            if(appToOpen.isEmpty()) sh*s.getDouble("y").toFloat() else sh*0.5f,
+                            if(appToOpen.isNotEmpty()) "open:$appToOpen" else if(s.has("action")) s.getString("action") else "tap"
+                        ))
                     }
-                    currentStep = 0
-                    agentActive = true
+                    currentStep=0; agentActive=true
                     handler.post { executeAgentStep() }
                 } else {
-                    handler.post { glowing=false; showBubble(rawReply.take(100),5000) }
+                    handler.post { glowing=false; showBubble(rawReply.take(120),6000) }
                 }
             } catch(e:Exception) {
-                handler.post { glowing=false; thinking=false; showBubble("planning failed, try again 👀",3000) }
+                handler.post { glowing=false; showBubble("planning failed 👀",3000) }
             }
         }.start()
     }
 
     private fun executeAgentStep() {
-        if (currentStep >= agentSteps.size) {
-            finishAgent()
-            return
-        }
-        val step = agentSteps[currentStep]
+        if (currentStep>=agentSteps.size) { finishAgent(); return }
+        val step=agentSteps[currentStep]
 
-        // Handle open app action
         if (step.action.startsWith("open:")) {
-            val appName = step.action.removePrefix("open:")
-            showBubble(step.instruction, 0)
+            val appName=step.action.removePrefix("open:")
+            showBubble(step.instruction,0)
             launchApp(appName)
-            handler.postDelayed({ nextAgentStep() }, 2000)
+            handler.postDelayed({ nextAgentStep() },2000)
             return
         }
 
-        // Move cursor to target position
-        tx = step.targetX
-        ty = step.targetY
+        // Try accessibility first for real position
+        val keywords=step.instruction.lowercase()
+            .replace("tap","").replace("click","").replace("button","").replace("the","").trim()
+        val realPos=GoobleAccessibilityService.findNodePosition(keywords)
+        tx=realPos?.get(0)?:step.targetX
+        ty=realPos?.get(1)?:step.targetY
 
-        // Wait for cursor to arrive then show instruction
         handler.postDelayed({
-            glowing = true
-            glowCol = Color.argb(200, 255, 220, 50) // yellow = waiting for tap
-            waitingForTap = true
+            glowing=true; glowCol=Color.argb(200,255,220,50)
+            waitingForTap=true
             handler.post { cursorView.invalidate() }
-            showBubble(step.instruction, 0)
-            vib(longArrayOf(0, 50, 100, 50))
-        }, 1200)
+            showBubble(step.instruction,0)
+            vib(longArrayOf(0,50,100,50))
+        },1200)
     }
 
     private fun nextAgentStep() {
         currentStep++
-        if (currentStep >= agentSteps.size) {
-            finishAgent()
-        } else {
-            executeAgentStep()
+        if (currentStep>=agentSteps.size) finishAgent()
+        else {
+            // Take fresh screenshot for next step context
+            handler.postDelayed({ executeAgentStep() },800)
         }
     }
 
     private fun finishAgent() {
-        agentActive = false
-        agentSteps.clear()
-        currentStep = 0
-        waitingForTap = false
-        glowing = false
+        agentActive=false; agentSteps.clear(); currentStep=0
+        waitingForTap=false; glowing=false
         handler.post { cursorView.invalidate() }
         showBubble("all done! 🎉",3000)
         vib(longArrayOf(0,50,100,50,100,50))
     }
 
     private fun stopAgent() {
-        agentActive = false
-        agentSteps.clear()
-        currentStep = 0
-        waitingForTap = false
-        glowing = false
+        agentActive=false; agentSteps.clear(); currentStep=0
+        waitingForTap=false; glowing=false
         handler.post { cursorView.invalidate() }
     }
-
-    // ─── ROAMING (only when agent not active) ───────────────────
 
     private fun startRoaming() {
         handler.post(object : Runnable {
             override fun run() {
-                if (!listening && !agentActive && !waitingForTap) {
+                if (!listening&&!agentActive&&!waitingForTap) {
                     val m=100f
                     tx=m+(Math.random()*(sw-m*2)).toFloat()
                     ty=m+(Math.random()*(sh-m*2)).toFloat()
@@ -522,8 +591,8 @@ Rules:
                     cp.x=px.toInt(); cp.y=py.toInt()
                     wm.updateViewLayout(cursorView,cp)
                     val bp=bubbleView.layoutParams as WindowManager.LayoutParams
-                    bp.x=(px-8f).toInt().coerceIn(8,sw-388)
-                    bp.y=(py+62f).toInt().coerceIn(8,sh-163)
+                    bp.x=(px-8f).toInt().coerceIn(8,sw-428)
+                    bp.y=(py+62f).toInt().coerceIn(8,sh-208)
                     wm.updateViewLayout(bubbleView,bp)
                 } catch(e:Exception){}
                 handler.postDelayed(this,16)
@@ -532,8 +601,8 @@ Rules:
     }
 
     private fun launchApp(name: String) {
-        val pm = packageManager
-        val packages = mapOf(
+        val pm=packageManager
+        val packages=mapOf(
             "whatsapp" to "com.whatsapp",
             "instagram" to "com.instagram.android",
             "chrome" to "com.android.chrome",
@@ -563,11 +632,11 @@ Rules:
             "calculator" to "com.android.calculator2",
             "clock" to "com.android.deskclock"
         )
-        val pkg = packages.entries.firstOrNull { name.contains(it.key) }?.value
-        if (pkg != null) {
+        val pkg=packages.entries.firstOrNull { name.contains(it.key) }?.value
+        if (pkg!=null) {
             try {
-                val launch = pm.getLaunchIntentForPackage(pkg)
-                if (launch != null) {
+                val launch=pm.getLaunchIntentForPackage(pkg)
+                if (launch!=null) {
                     launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     startActivity(launch)
                     showBubble("opened $name ✓",2000)
@@ -575,16 +644,16 @@ Rules:
             } catch(e:Exception) { showBubble("couldn't open $name",2500) }
         } else {
             try {
-                val match = pm.getInstalledApplications(0).firstOrNull {
+                val match=pm.getInstalledApplications(0).firstOrNull {
                     pm.getApplicationLabel(it).toString().lowercase().contains(name)
                 }
-                if (match != null) {
-                    val launch = pm.getLaunchIntentForPackage(match.packageName)
+                if (match!=null) {
+                    val launch=pm.getLaunchIntentForPackage(match.packageName)
                     launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     launch?.let { startActivity(it) }
                     showBubble("opened ${pm.getApplicationLabel(match)} ✓",2000)
                 } else showBubble("can't find $name 👀",2500)
-            } catch(e:Exception) { showBubble("error opening $name",2500) }
+            } catch(e:Exception) { showBubble("error: $name",2500) }
         }
     }
 
@@ -596,7 +665,7 @@ Rules:
         }
         if (duration>0) handler.postDelayed({
             handler.post { bubbleView.visibility=View.GONE; bVisible=false }
-        }, duration)
+        },duration)
     }
 
     private fun askAI(prompt: String) {
@@ -618,11 +687,11 @@ Rules:
                     connectTimeout=12000; readTimeout=20000; doOutput=true
                 }
                 val safe=prompt.replace("\"","'").replace("\n"," ")
-                conn.outputStream.write("""{"model":"llama-3.1-8b-instant","messages":[{"role":"system","content":"You are Gooble, a witty AI cursor assistant on Android. Max 25 words. Be sharp and helpful."},{"role":"user","content":"$safe"}]}""".toByteArray())
+                conn.outputStream.write("""{"model":"llama-3.1-8b-instant","messages":[{"role":"system","content":"You are Gooble, a witty AI cursor assistant on Android. Max 40 words. Be sharp and helpful."},{"role":"user","content":"$safe"}]}""".toByteArray())
                 val reply=JSONObject(conn.inputStream.bufferedReader().readText())
                     .getJSONArray("choices").getJSONObject(0)
                     .getJSONObject("message").getString("content").trim()
-                handler.post { thinking=false; glowing=false; showBubble(reply,7000) }
+                handler.post { thinking=false; glowing=false; showBubble(reply,8000) }
             } catch(e:Exception) {
                 handler.post { thinking=false; glowing=false; showBubble("try again 👀",3000) }
             }
@@ -636,7 +705,7 @@ Rules:
                 .createNotificationChannel(NotificationChannel(id,"Gooble",NotificationManager.IMPORTANCE_LOW))
         return NotificationCompat.Builder(this,id)
             .setContentTitle("Gooble 👀")
-            .setContentText("Tap & hold to talk | Tap cursor to confirm steps")
+            .setContentText("Tap & hold to talk")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setPriority(NotificationCompat.PRIORITY_LOW).build()
     }
@@ -645,6 +714,8 @@ Rules:
         super.onDestroy()
         handler.removeCallbacksAndMessages(null)
         sr?.destroy()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
         try { wm.removeView(cursorView) } catch(e:Exception){}
         try { wm.removeView(bubbleView) } catch(e:Exception){}
     }
